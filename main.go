@@ -19,9 +19,10 @@ import (
 // send accept request to acceptors
 // acceptors accept if number is greater than they've seen, notify distinguished learners
 
-type promiseResponse struct {
-	MinAcceptID       int
-	HighestAcceptedID int
+type prepareResponse struct {
+	HighestProposalID  int
+	HighestProposalVal int
+	HighestAcceptedID  int
 }
 
 type acceptResponse struct {
@@ -31,8 +32,9 @@ type acceptResponse struct {
 }
 
 type request struct {
-	proposalID  int
-	proposalVal int
+	proposalID        int
+	proposalVal       int
+	highestAcceptedID int
 }
 
 func init() {
@@ -52,13 +54,17 @@ func main() {
 		numNodes = 3
 	}
 
+	// these are leader specific communication channels and can be shared
+	// in node creation (lets the nodes talk to the leader)
 	inputChan := make(chan int)
 	acceptResponseChan := make(chan acceptResponse)
-	promiseResponseChan := make(chan promiseResponse)
+	prepareResponseChan := make(chan prepareResponse)
 
 	allNodes := make([]*node, 0)
 	for i := 0; i <= numNodes; i++ {
-		promiseRequestChan := make(chan request)
+		// these channels are node specific so a leader or learner can communicate
+		// directly to a given node
+		prepareRequestChan := make(chan request)
 		acceptRequestChan := make(chan request)
 		learnReceiveChan := make(chan acceptResponse)
 		allNodes = append(allNodes, &node{
@@ -66,8 +72,8 @@ func main() {
 			commands:            make(map[int]int),
 			acceptResponseChan:  acceptResponseChan,
 			acceptRequestChan:   acceptRequestChan,
-			promiseResponseChan: promiseResponseChan,
-			promiseRequestChan:  promiseRequestChan,
+			prepareResponseChan: prepareResponseChan,
+			prepareRequestChan:  prepareRequestChan,
 			learnReceiveChan:    learnReceiveChan,
 		})
 	}
@@ -83,66 +89,123 @@ func main() {
 		learnerB = 1
 	}
 
-	distinguishedLearners := []*node{allNodes[learnerA], allNodes[learnerB]}
+	distinguishedLearners := []*node{allNodes[leader], allNodes[learnerA], allNodes[learnerB]}
 
 	vlog("initial setup:\n\tNode Count: %d\n\tLeaderID: %d\n\tDistinguished Learner IDs: %d, %d", numNodes, leader, learnerA, learnerB)
 
-	go runLeader(allNodes, leader, inputChan)
-
 	for i, _ := range allNodes {
 		if i == leader {
+			go runLeader(allNodes, leader, learnerA, learnerB, inputChan)
 			continue
 		}
-		go runNode(allNodes[i], distinguishedLearners)
+		go runNode(allNodes[i], distinguishedLearners, allNodes)
 	}
 
 	// block for a while
 	<-time.After(1 * time.Hour)
 }
 
-func runLeader(allNodes []*node, leader int, inputChan chan int) {
+func runLeader(allNodes []*node, leader int, learnerA int, learnerB int, inputChan chan int) {
 	go getInputDataForLeader(inputChan)
 
 	maxStepsAhead := 2
-	currentStep := 0
+	highestAcceptedID := -1
+	proposalCounts := make(map[int]int)
+	acceptCounts := make(map[int]int)
+	history := make([]request, 0)
 
 	var proposalID int
-	for {
-		select {
-		case in := <-inputChan:
-			vlog("leader received input value %d", in)
-			proposalID++
+	// sending
+	go func() {
+		for {
+			select {
+			case in := <-inputChan:
+				vlog("leader received input value %d", in)
+				proposalID++
 
-			// don't get too far ahead
-			for proposalID > currentStep+maxStepsAhead {
-				<-time.After(1 * time.Second)
-			}
+				// track the number of responses we get here
+				proposalCounts[proposalID] = 0
+				acceptCounts[proposalID] = 0
 
-			for _, n := range allNodes {
-				go func(n *node, pID int, pVal int) {
-					vlog("leader issuing proposal %d (%d) to node id %d", pID, pVal, n.id)
-					n.promiseRequestChan <- request{
-						proposalID:  pID,
-						proposalVal: pVal,
-					}
-				}(n, proposalID, in)
+				// don't get too far ahead
+				for proposalID > highestAcceptedID+maxStepsAhead {
+					vlog("blocking proposal id %d > %d + %d", proposalID, highestAcceptedID, maxStepsAhead)
+					<-time.After(1 * time.Second)
+				}
+
+				for _, n := range allNodes {
+					go func(n *node, pID int, pVal int, highestAcceptedID int) {
+						vlog("leader issuing proposal %d (%d) to node id %d", pID, pVal, n.id)
+						n.prepareRequestChan <- request{
+							proposalID:        pID,
+							proposalVal:       pVal,
+							highestAcceptedID: highestAcceptedID,
+						}
+					}(n, proposalID, in, highestAcceptedID)
+				}
 			}
-		case pr := <-allNodes[leader].promiseResponseChan:
-			vlog("leader received promise response %#v", pr)
-		case ar := <-allNodes[leader].acceptResponseChan:
-			vlog("leader received accept response %#v", ar)
 		}
-	}
+	}()
+
+	go func() {
+		for {
+			select {
+			case pr := <-allNodes[leader].prepareResponseChan:
+				vlog("leader received prepare response %#v", pr)
+				proposalCounts[pr.HighestProposalID] = proposalCounts[pr.HighestProposalID] + 1
+				if proposalCounts[pr.HighestProposalID] >= ((len(allNodes) / 2) + 1) {
+					for _, n := range allNodes {
+						go func(n *node, pID int, pVal int, highestAcceptedID int) {
+							vlog("leader issuing accept request %d (%d) to node id %d", pID, pVal, n.id)
+							n.acceptRequestChan <- request{
+								proposalID:        pID,
+								proposalVal:       pVal,
+								highestAcceptedID: highestAcceptedID,
+							}
+						}(n, pr.HighestProposalID, pr.HighestProposalVal, highestAcceptedID)
+					}
+				}
+
+			case ar := <-allNodes[leader].acceptResponseChan:
+				vlog("leader received accept response %#v", ar)
+				acceptCounts[ar.acceptedID] = acceptCounts[ar.acceptedID] + 1
+				if acceptCounts[ar.acceptedID] >= ((len(allNodes) / 2) + 1) {
+					// get more accepted than nodes/2 + 1 and we have a winner
+					highestAcceptedID = ar.acceptedID
+					history = append(history, request{proposalID: ar.acceptedID, proposalVal: ar.acceptedVal})
+					vlog("leader sending accept response to distinguished learners: %#v", ar)
+
+					allNodes[learnerA].learnReceiveChan <- ar
+					allNodes[learnerB].learnReceiveChan <- ar
+				}
+			}
+		}
+	}()
+
+	// block a while
+	<-time.After(1 * time.Hour)
 }
 
-func runNode(n *node, learners []*node) {
+func runNode(n *node, learners []*node, allNodes []*node) {
 	vlog("node id %d starting", n.id)
+
+	promisedID := -1
+	acceptedID := -1
+
 	for {
 		select {
 		case r := <-n.acceptRequestChan:
 			vlog("node id %d accept request %#v", n.id, r)
-		case r := <-n.promiseRequestChan:
-			vlog("node id %d promise request %#v", n.id, r)
+			if r.proposalID > acceptedID && r.proposalID >= promisedID {
+				acceptedID = r.proposalID
+				n.acceptResponseChan <- acceptResponse{accepted: true, acceptedID: acceptedID, acceptedVal: r.proposalVal}
+			}
+		case r := <-n.prepareRequestChan:
+			vlog("node id %d prepare request %#v", n.id, r)
+			if r.proposalID > promisedID {
+				promisedID = r.proposalID
+				n.prepareResponseChan <- prepareResponse{HighestAcceptedID: acceptedID, HighestProposalID: promisedID, HighestProposalVal: r.proposalVal}
+			}
 		case r := <-n.learnReceiveChan:
 			vlog("node id %d learning request %#v", n.id, r)
 		}
@@ -155,8 +218,8 @@ type node struct {
 
 	acceptResponseChan  chan acceptResponse
 	acceptRequestChan   chan request
-	promiseResponseChan chan promiseResponse
-	promiseRequestChan  chan request
+	prepareResponseChan chan prepareResponse
+	prepareRequestChan  chan request
 	learnReceiveChan    chan acceptResponse
 
 	currentProposalID int
@@ -173,7 +236,7 @@ func getInputDataForLeader(inputChan chan int) {
 	// read in data somewhere
 	for i := 0; i <= 10; i++ {
 		vlog("Sending input value %d to leader", i)
-		inputChan <- i * i
+		inputChan <- (i * i)
 	}
 }
 
