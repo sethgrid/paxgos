@@ -17,15 +17,10 @@ import (
 	"github.com/gorilla/mux"
 )
 
-type node struct{}
-
-var Verbose bool
-
 func main() {
 	var numNodes int
 	var startingPort int
 
-	flag.BoolVar(&Verbose, "v", false, "set flag -v to see verbose logging")
 	flag.IntVar(&numNodes, "nodes", 5, "set the number of nodes. Minimum 3.")
 	flag.IntVar(&startingPort, "starting-port", 9000, "starting with this port, listen on port +1, +2, +3, ..., + number of nodes. A value of 0 will assign random ports.")
 	flag.Parse()
@@ -46,9 +41,11 @@ func main() {
 	}
 }
 
-// index 0 will be the leader
+// index 0 will be the leader, all other node's id's will match index position
 var ports []string
 
+// runNodes creates http servers for a given number of nodes and blocks.
+// A special endpoint is created for the leader node (node id 0), '/propose/{val}'.
 func runNodes(count, startingPort int) error {
 	ports = make([]string, 0)
 	for i := 0; i <= count; i++ {
@@ -105,6 +102,9 @@ func runNodes(count, startingPort int) error {
 	return nil
 }
 
+// Payload handles the couple of payloads that will be acceptor responses,
+// but doubles as the struct that stores history on learning nodes
+// (something something single responsiblity something something violation).
 type Payload struct {
 	NodeID int
 	// phase 1.b acceptor response: I wont promise to anything below this
@@ -118,26 +118,139 @@ type Payload struct {
 	AcceptedVal int
 }
 
+// prepareID is a counter for the distinguished proposer (leader). It is global to act stateful.
 var prepareID int64
 
+// proposeHandler allows the proposer to take in requests and
+// will send a prepare and accept request to acceptors and
+// will notify learners of new values. Pretty much Paxos lite.
 func proposeHandler(w http.ResponseWriter, r *http.Request) {
+	// for collecting responses from acceptors
 	prepareChan := make(chan Payload)
 	acceptChan := make(chan Payload)
 
-	// Phase 1.a
-	val := mux.Vars(r)["val"]
-	log.Printf("New proposed value: %v", val)
+	val, err := strconv.ParseInt(mux.Vars(r)["val"], 10, 64)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("provided value should be an integer"))
+		return
+	}
+
+	log.Printf("New proposed value: %d", val)
 	id := atomic.AddInt64(&prepareID, 1)
 
+	// Phase 1.a, blocks until we have a majority response
+	phaseRunnerA("phase 1.a", id, val, prepareChan)
+
+	// Phase 2.a; blocks until we have a majority reponse
+	phaseRunnerA("phase 2.a", id, val, acceptChan)
+
+	// learning phase
+	sendToLeaners(id, val)
+
+	w.Write([]byte(fmt.Sprintf("CommandID: %d, Value %v\n", id, val)))
+}
+
+// this global state syncs our learner nodes; I don't think it is against the spirit to have this
+var learners struct {
+	sync.Mutex
+	history map[int][]Payload
+}
+
+// learnHandler takes in a request and stores a command id and value to history
+func learnHandler(w http.ResponseWriter, r *http.Request) {
+	nodeID := determineNodeID(r.Host)
+	vars := mux.Vars(r)
+	id, err := strconv.ParseInt(vars["id"], 10, 64)
+	if err != nil {
+		log.Println("Node %d: Error in prepare, bad id - %v", nodeID, err)
+	}
+	val, err := strconv.Atoi(vars["val"])
+	if err != nil {
+		log.Println("Node %d: Error in prepare, bad val - %v", nodeID, err)
+	}
+
+	log.Printf("Node %d: learning id %d value %d", nodeID, id, val)
+
+	learners.Lock()
+	defer learners.Unlock()
+	learners.history[nodeID] = append(learners.history[nodeID], Payload{NodeID: nodeID, AcceptedID: id, AcceptedVal: val})
+}
+
+// this global state unfortuneately syncs our nodes; will need something that does not
+var acceptors struct {
+	sync.Mutex
+	// [id] Payload where Payload is the last response sent
+	state map[int]Payload
+}
+
+// prepareHandler acts as Phase 1.b. of Paxos, allowing an acceptor to take a prepare request
+func prepareHandler(w http.ResponseWriter, r *http.Request) {
+	nodeID := determineNodeID(r.Host)
+	vars := mux.Vars(r)
+	id, err := strconv.ParseInt(vars["id"], 10, 64)
+	if err != nil {
+		log.Println("Node %d: Error in prepare, bad id - %v", nodeID, err)
+	}
+	val, err := strconv.ParseInt(vars["val"], 10, 64)
+	if err != nil {
+		log.Println("Node %d: Error in prepare, bad val - %v", nodeID, err)
+	}
+	log.Printf("Node %d: New Prepare [id] value: [%d] %d", nodeID, id, val)
+
+	state, err := phaseRunnerB("phase 2.b", nodeID, id, val)
+	if err != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// let the leader know our response
+	err = json.NewEncoder(w).Encode(state)
+	if err != nil {
+		log.Printf("Node %d: error encoding state: %v", err)
+	}
+}
+
+// aceptHandler acts as Phase 2.b of Paxos, allowing an acceptor to take an accept request
+func acceptHandler(w http.ResponseWriter, r *http.Request) {
+	nodeID := determineNodeID(r.Host)
+	vars := mux.Vars(r)
+	id, err := strconv.ParseInt(vars["id"], 10, 64)
+	if err != nil {
+		log.Println("Node %d: Error in accept, bad id - %v", nodeID, err)
+	}
+	val, err := strconv.ParseInt(vars["val"], 10, 64)
+	if err != nil {
+		log.Println("Node %d: Error in accept, bad val - %v", nodeID, err)
+	}
+	log.Printf("Node %d: New accept [id] value: [%d] %d", nodeID, id, val)
+
+	state, err := phaseRunnerB("phase 2.b", nodeID, id, val)
+	if err != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// let the leader know our response
+	err = json.NewEncoder(w).Encode(state)
+	if err != nil {
+		log.Printf("Node %d: error encoding state: %v", err)
+	}
+}
+
+// phaseRunnerA handles phase 1.a and 2.a of this paxos toy
+func phaseRunnerA(phase string, id int64, val int64, payloadChan chan Payload) {
+	// go over each known node (registered in ports)
 	for i, _ := range ports {
 		if i == 0 {
 			// don't call the leader. we already are the leader
 			continue
 		}
+
+		// send out all the prepare requests
 		go func(i int) {
-			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/prepare/%d/%s", ports[i], id, val))
+			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/prepare/%d/%d", ports[i], id, val))
 			if err != nil {
-				log.Printf("error: phase 1.a - leader GET error with prepare id %d :: %v", id, err)
+				log.Printf("error: %s - leader GET error with prepare id %d :: %v", phase, id, err)
 				return
 			}
 			defer resp.Body.Close()
@@ -149,17 +262,17 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 
 			data, err := ioutil.ReadAll(resp.Body)
 			if err != nil {
-				log.Printf("error: phase 1.a - leader Read error with prepare id %d :: %v", id, err)
+				log.Printf("error: %s - leader Read error with prepare id %d :: %v", phase, id, err)
 				return
 			}
 			payload := Payload{}
 			err = json.Unmarshal(data, &payload)
 			if err != nil {
-				log.Printf("error: phase 1.a - leader Unmarshal error with prepare id %d :: %v", id, err)
+				log.Printf("error: %s - leader Unmarshal error with prepare id %d :: %v", phase, id, err)
 				return
 			}
 			select {
-			case prepareChan <- payload:
+			case payloadChan <- payload:
 			case <-time.After(1 * time.Minute):
 				// don't leak goroutines
 				return
@@ -167,6 +280,7 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 		}(i)
 	}
 
+	// collect prepare respsonses until we have a majority
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 
@@ -174,10 +288,11 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 		counter := 0
 		for {
 			select {
-			case p := <-prepareChan:
-				log.Printf("got prepare response: %#v", p)
+			case p := <-payloadChan:
+				log.Printf("got %s response: %#v", phase, p)
 
 				// unusual edge case perhaps, but called for in the paxos algorythm
+				// on the promise stage
 				if p.PromiseID > id {
 					// racy. consider atomic all over the place? yuck.
 					id = p.PromiseID
@@ -199,68 +314,44 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	wg.Wait()
-	// Phase 2.a; we got a majority of responses
+}
 
-	for i, _ := range ports {
-		if i == 0 {
-			// don't call the leader. we already are the leader
-			continue
-		}
-		go func(i int) {
-			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/accept/%d/%s", ports[i], id, val))
-			if err != nil {
-				log.Printf("error: phase 2.a - leader GET error with accept id %d :: %v", id, err)
-				return
-			}
-			defer resp.Body.Close()
-			data, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				log.Printf("error: phase 2.a - leader Read error with accept id %d :: %v", id, err)
-				return
-			}
-			payload := Payload{}
-			err = json.Unmarshal(data, &payload)
-			if err != nil {
-				log.Printf("error: phase 2.a - leader Unmarshal error with accept id %d :: %v", id, err)
-				return
-			}
-			select {
-			case acceptChan <- payload:
-			case <-time.After(1 * time.Minute):
-				// don't leak goroutines
-				return
-			}
-		}(i)
+// phaseRunnerB handles phase 1.b and 2.b of this paxos toy
+func phaseRunnerB(phase string, nodeID int, id int64, val int64) (Payload, error) {
+	// TODO - figure out a better way to not lock all acceptors
+	acceptors.Lock()
+	defer acceptors.Unlock()
+
+	// init acceptor state if needed
+	state, ok := acceptors.state[nodeID]
+	if !ok {
+		state = Payload{}
+		state.NodeID = nodeID
 	}
 
-	wg2 := &sync.WaitGroup{}
-	wg2.Add(1)
+	// if we have newer request already handled, reject this request
+	if id < state.PromiseID || id < state.AcceptedID {
+		log.Printf("Node %d: command id %d less than promise id %d or accepted id %d", nodeID, id, state.PromiseID, state.AcceptedID)
+		return state, fmt.Errorf("rejected")
+	}
 
-	go func() {
-		counter := 0
-		for {
-			select {
-			case p := <-acceptChan:
-				log.Printf("got accept response: %#v", p)
-				counter++
-				if counter > len(ports)/2+1 {
-					wg2.Done()
-				}
-			case <-time.After(1 * time.Minute):
-				// don't leak the goroutine
-				return
-			}
-		}
-	}()
+	// if we use distinguished learners (more than the one leader), we would communicate to them here upon acceptance
+	if phase == "phase 2.b" {
+		// pass
+	}
 
-	wg2.Wait()
-	w.Write([]byte(fmt.Sprintf("CommandID: %d, Value %v\n", id, val)))
+	// update state
+	state.AcceptedID = id
+	acceptors.state[nodeID] = state
 
-	// communicate out to all learners
+	return state, nil
+}
 
+// sendToLearners is the learn phase of this paxos toy
+func sendToLeaners(id, val int64) {
 	for i, _ := range ports {
 		go func(i int) {
-			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/learn/%d/%s", ports[i], id, val))
+			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/learn/%d/%d", ports[i], id, val))
 			if err != nil {
 				log.Printf("error: phase learn - leader GET error with accept id %d :: %v", id, err)
 				return
@@ -274,111 +365,8 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// this global state unfortuneately syncs our nodes; will need something that does not
-var acceptors struct {
-	sync.Mutex
-	// [id] Payload where Payload is the last response sent
-	state map[int]Payload
-}
-
-func prepareHandler(w http.ResponseWriter, r *http.Request) {
-	// Phase 1.b
-	nodeID := determineNodeID(r.Host)
-	vars := mux.Vars(r)
-	id, err := strconv.ParseInt(vars["id"], 10, 64)
-	if err != nil {
-		log.Println("Node %d: Error in prepare, bad id - %v", nodeID, err)
-	}
-	val, err := strconv.Atoi(vars["val"])
-	if err != nil {
-		log.Println("Node %d: Error in prepare, bad val - %v", nodeID, err)
-	}
-	log.Printf("Node %d: New Prepare [id] value: [%d] %d", nodeID, id, val)
-
-	acceptors.Lock()
-	defer acceptors.Unlock()
-	state, ok := acceptors.state[nodeID]
-	if !ok {
-		state = Payload{}
-		state.NodeID = nodeID
-	}
-
-	if id < state.PromiseID || id < state.AcceptedID {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	state.PromiseID = id
-	acceptors.state[nodeID] = state
-	err = json.NewEncoder(w).Encode(state)
-	if err != nil {
-		log.Printf("Node %d: error encoding state: %v", err)
-	}
-}
-
-func acceptHandler(w http.ResponseWriter, r *http.Request) {
-	// Phase 2.b
-	nodeID := determineNodeID(r.Host)
-	vars := mux.Vars(r)
-	id, err := strconv.ParseInt(vars["id"], 10, 64)
-	if err != nil {
-		log.Println("Node %d: Error in accept, bad id - %v", nodeID, err)
-	}
-	val, err := strconv.Atoi(vars["val"])
-	if err != nil {
-		log.Println("Node %d: Error in accept, bad val - %v", nodeID, err)
-	}
-	log.Printf("Node %d: New accept [id] value: [%d] %d", nodeID, id, val)
-
-	acceptors.Lock()
-	defer acceptors.Unlock()
-	state, ok := acceptors.state[nodeID]
-	if !ok {
-		state = Payload{}
-		state.NodeID = nodeID
-	}
-
-	if id < state.PromiseID || id < state.AcceptedID {
-		w.WriteHeader(http.StatusNoContent)
-		log.Printf("Node %d: command id %d less than promise id %d or accepted id %d", nodeID, id, state.PromiseID, state.AcceptedID)
-		return
-	}
-
-	// if we use distinguished learners (more than the one leader), we would communicate to them here upon acceptance
-
-	state.AcceptedID = id
-	acceptors.state[nodeID] = state
-	err = json.NewEncoder(w).Encode(state)
-	if err != nil {
-		log.Printf("Node %d: error encoding state: %v", err)
-	}
-}
-
-var learners struct {
-	sync.Mutex
-	history map[int][]Payload
-}
-
-func learnHandler(w http.ResponseWriter, r *http.Request) {
-	nodeID := determineNodeID(r.Host)
-	vars := mux.Vars(r)
-	id, err := strconv.ParseInt(vars["id"], 10, 64)
-	if err != nil {
-		log.Println("Node %d: Error in prepare, bad id - %v", nodeID, err)
-	}
-	val, err := strconv.Atoi(vars["val"])
-	if err != nil {
-		log.Println("Node %d: Error in prepare, bad val - %v", nodeID, err)
-	}
-
-	log.Printf("Node %d: learning id %d value %d", nodeID, id, val)
-
-	learners.Lock()
-	defer learners.Unlock()
-	learners.history[nodeID] = append(learners.history[nodeID], Payload{NodeID: nodeID, AcceptedID: id, AcceptedVal: val})
-}
-
-// node id is based on location in the ports array due to how we started each node
+// determineNodeID gives us a node id based on the port location in the ports array.
+// This works due to the implementation of storing nodes and ports globally.
 func determineNodeID(requestHost string) int {
 	parts := strings.Split(requestHost, ":")
 	if len(parts) != 2 {
