@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"strconv"
@@ -16,6 +17,10 @@ import (
 
 	"github.com/gorilla/mux"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 func main() {
 	var numNodes int
@@ -68,8 +73,8 @@ func runNodes(count, startingPort int) error {
 		}
 
 		// acceptor endpoints
-		r.HandleFunc("/prepare/{id}/{val}", prepareHandler)
-		r.HandleFunc("/accept/{id}/{val}", acceptHandler)
+		r.HandleFunc("/prepare/{id}/{val}", randomDelay(prepareHandler))
+		r.HandleFunc("/accept/{id}/{val}", randomDelay(acceptHandler))
 
 		// learner endpoint
 		r.HandleFunc("/learn/{id}/{val}", learnHandler)
@@ -102,6 +107,18 @@ func runNodes(count, startingPort int) error {
 	return nil
 }
 
+// introduce random delays in endpoints with occasional failure (ie, very long delay)
+func randomDelay(fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if rand.Intn(20) == 1 {
+			log.Println("long delay initiated...")
+			<-time.After(time.Duration(1 * time.Minute))
+		}
+		<-time.After(time.Duration(rand.Intn(3000)+1) * time.Millisecond)
+		fn.ServeHTTP(w, r)
+	}
+}
+
 // Payload handles the couple of payloads that will be acceptor responses,
 // but doubles as the struct that stores history on learning nodes
 // (something something single responsiblity something something violation).
@@ -120,6 +137,7 @@ type Payload struct {
 
 // prepareID is a counter for the distinguished proposer (leader). It is global to act stateful.
 var prepareID int64
+var lastAckedID int64
 
 // proposeHandler allows the proposer to take in requests and
 // will send a prepare and accept request to acceptors and
@@ -139,6 +157,12 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("New proposed value: %d", val)
 	id := atomic.AddInt64(&prepareID, 1)
 
+	// don't get ahead of ourselves by too far...
+	var maxGap int64 = 1
+	for id > atomic.LoadInt64(&lastAckedID)+maxGap {
+		<-time.After(1 * time.Second)
+	}
+
 	// Phase 1.a, blocks until we have a majority response
 	phaseRunnerA("phase 1.a", id, val, prepareChan)
 
@@ -146,6 +170,7 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 	phaseRunnerA("phase 2.a", id, val, acceptChan)
 
 	// learning phase
+	atomic.SwapInt64(&lastAckedID, id)
 	sendToLeaners(id, val)
 
 	w.Write([]byte(fmt.Sprintf("CommandID: %d, Value %v\n", id, val)))
@@ -285,6 +310,13 @@ func phaseRunnerA(phase string, id int64, val int64, payloadChan chan Payload) {
 	wg.Add(1)
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if !strings.Contains(r.(string), "WaitGroup") {
+					fmt.Println("Recovered", r)
+				}
+			}
+		}()
 		counter := 0
 		for {
 			select {
@@ -297,13 +329,16 @@ func phaseRunnerA(phase string, id int64, val int64, payloadChan chan Payload) {
 					// racy. consider atomic all over the place? yuck.
 					id = p.PromiseID
 					// also adjust the prepareID for future requests
-					swapped := atomic.CompareAndSwapInt64(&prepareID, atomic.LoadInt64(&prepareID), p.PromiseID)
-					if !swapped {
-						log.Println("WARNING: unable to swap for larger promise id")
-					}
+					atomic.SwapInt64(&prepareID, p.PromiseID)
 				}
 				counter++
-				if counter > len(ports)/2+1 {
+				majority := len(ports) / 2
+				if len(ports)%2 == 1 {
+					majority += 1
+				}
+				log.Printf("looking for majority of %d", majority)
+				if counter > majority {
+					log.Printf("majority found")
 					wg.Done()
 				}
 			case <-time.After(1 * time.Minute):
