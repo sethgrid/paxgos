@@ -39,6 +39,7 @@ func main() {
 
 	// init states
 	acceptors.state = make(map[int]Payload)
+	learners.history = make(map[int][]Payload)
 
 	if err := runNodes(numNodes, startingPort); err != nil {
 		log.Fatal(err)
@@ -77,7 +78,16 @@ func runNodes(count, startingPort int) error {
 		r.HandleFunc("/learn/{id}/{val}", learnHandler)
 
 		// default
-		r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("root\n")) })
+		r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			nodeID := determineNodeID(r.Host)
+			learners.Lock()
+			defer learners.Unlock()
+			content := "History:\n"
+			for _, command := range learners.history[nodeID] {
+				content += fmt.Sprintf("id %d val %d\n", command.AcceptedID, command.AcceptedVal)
+			}
+			w.Write([]byte(content))
+		})
 
 		log.Printf("Starting node on :%s", l.Addr().String())
 		go func(r *mux.Router) {
@@ -98,9 +108,14 @@ func runNodes(count, startingPort int) error {
 type Payload struct {
 	NodeID int
 	// phase 1.b acceptor response: I wont promise to anything below this
+	// phase 2.b unused
 	PromiseID int64
 	// phase 1.b acceptor response: this is the highest accepted id I've accepted
+	// phase 2.b acceptor response: this is the id I just accepted
 	AcceptedID int64
+
+	// learn phase
+	AcceptedVal int
 }
 
 var prepareID int64
@@ -126,6 +141,12 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusNoContent {
+				// node rejected our request
+				return
+			}
+
 			data, err := ioutil.ReadAll(resp.Body)
 			if err != nil {
 				log.Printf("error: phase 1.a - leader Read error with prepare id %d :: %v", id, err)
@@ -234,8 +255,26 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 
 	wg2.Wait()
 	w.Write([]byte(fmt.Sprintf("CommandID: %d, Value %v\n", id, val)))
+
+	// communicate out to all learners
+
+	for i, _ := range ports {
+		go func(i int) {
+			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/learn/%d/%s", ports[i], id, val))
+			if err != nil {
+				log.Printf("error: phase learn - leader GET error with accept id %d :: %v", id, err)
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("error: phase learn - unable to get 200ok - id %d :: %v", id, err)
+				return
+			}
+		}(i)
+	}
 }
 
+// this global state unfortuneately syncs our nodes; will need something that does not
 var acceptors struct {
 	sync.Mutex
 	// [id] Payload where Payload is the last response sent
@@ -276,6 +315,7 @@ func prepareHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Node %d: error encoding state: %v", err)
 	}
 }
+
 func acceptHandler(w http.ResponseWriter, r *http.Request) {
 	// Phase 2.b
 	nodeID := determineNodeID(r.Host)
@@ -304,6 +344,8 @@ func acceptHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// if we use distinguished learners (more than the one leader), we would communicate to them here upon acceptance
+
 	state.AcceptedID = id
 	acceptors.state[nodeID] = state
 	err = json.NewEncoder(w).Encode(state)
@@ -311,11 +353,29 @@ func acceptHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Node %d: error encoding state: %v", err)
 	}
 }
+
+var learners struct {
+	sync.Mutex
+	history map[int][]Payload
+}
+
 func learnHandler(w http.ResponseWriter, r *http.Request) {
+	nodeID := determineNodeID(r.Host)
 	vars := mux.Vars(r)
-	id := vars["id"]
-	val := vars["val"]
-	log.Printf("New Learn [id] value: [%v] %v", id, val)
+	id, err := strconv.ParseInt(vars["id"], 10, 64)
+	if err != nil {
+		log.Println("Node %d: Error in prepare, bad id - %v", nodeID, err)
+	}
+	val, err := strconv.Atoi(vars["val"])
+	if err != nil {
+		log.Println("Node %d: Error in prepare, bad val - %v", nodeID, err)
+	}
+
+	log.Printf("Node %d: learning id %d value %d", nodeID, id, val)
+
+	learners.Lock()
+	defer learners.Unlock()
+	learners.history[nodeID] = append(learners.history[nodeID], Payload{NodeID: nodeID, AcceptedID: id, AcceptedVal: val})
 }
 
 // node id is based on location in the ports array due to how we started each node
