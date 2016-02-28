@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -22,13 +23,23 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
+var EndpointRandomTimeCap time.Duration // set with flags
+var SmallTimeout time.Duration          // set with flags
+var BigTimeout time.Duration            // a multiple of SmallTimeout, used to avoid goroutine leaks
+var PercentToDelay int                  // set with flags
+
 func main() {
 	var numNodes int
 	var startingPort int
 
 	flag.IntVar(&numNodes, "nodes", 5, "set the number of nodes. Minimum 3.")
 	flag.IntVar(&startingPort, "starting-port", 9000, "starting with this port, listen on port +1, +2, +3, ..., + number of nodes. A value of 0 will assign random ports.")
+	flag.IntVar(&PercentToDelay, "failure-rate", 10, "the percent of acceptor requests to have unusually long delays, simulating failure.")
+	flag.DurationVar(&EndpointRandomTimeCap, "endpoint-random-cap", 3*time.Second, "acceptor endpoints (prepare/accept) will respond randomly within this time window")
+	flag.DurationVar(&SmallTimeout, "timeout", 1*time.Minute, "this timeout is how long the 'lost' nodes take to respond")
 	flag.Parse()
+
+	BigTimeout = 5 * SmallTimeout
 
 	if numNodes < 3 {
 		log.Printf("Got %d nodes, upping to minimum count of 3", numNodes)
@@ -70,6 +81,7 @@ func runNodes(count, startingPort int) error {
 		// only one proposer, the leader
 		if i == 0 {
 			r.HandleFunc("/propose/{val}", proposeHandler)
+			r.HandleFunc("/autopropose", autoProposeHandler)
 		}
 
 		// acceptor endpoints
@@ -110,11 +122,13 @@ func runNodes(count, startingPort int) error {
 // introduce random delays in endpoints with occasional failure (ie, very long delay)
 func randomDelay(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if rand.Intn(20) == 1 {
-			log.Println("long delay initiated...")
-			<-time.After(time.Duration(1 * time.Minute))
+		if rand.Intn(100) < PercentToDelay {
+			nodeID := determineNodeID(r.Host)
+			log.Printf(" >>>> long delay initiated for node %d <<< ", nodeID)
+			<-time.After(SmallTimeout)
 		}
-		<-time.After(time.Duration(rand.Intn(3000)+1) * time.Millisecond)
+		asMilliseconds := EndpointRandomTimeCap.Nanoseconds() / 1e6
+		<-time.After(time.Duration(asMilliseconds+1) * time.Millisecond)
 		fn.ServeHTTP(w, r)
 	}
 }
@@ -158,9 +172,10 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 	id := atomic.AddInt64(&prepareID, 1)
 
 	// don't get ahead of ourselves by too far...
+	// todo: implement logic for handling gaps and noops
 	var maxGap int64 = 1
 	for id > atomic.LoadInt64(&lastAckedID)+maxGap {
-		<-time.After(1 * time.Second)
+		<-time.After(200 * time.Millisecond)
 	}
 
 	// Phase 1.a, blocks until we have a majority response
@@ -174,6 +189,76 @@ func proposeHandler(w http.ResponseWriter, r *http.Request) {
 	sendToLeaners(id, val)
 
 	w.Write([]byte(fmt.Sprintf("CommandID: %d, Value %v\n", id, val)))
+}
+
+// flushWriter is used as a helper for autoProposeHandler to flush output instead
+// of buffering like http.ResponseWriter usually does
+type flushWriter struct {
+	f http.Flusher
+	w io.Writer
+}
+
+// Write allows the flusWriter to flush output per write
+func (fw *flushWriter) Write(p []byte) (n int, err error) {
+	n, err = fw.w.Write(p)
+	if fw.f != nil {
+		fw.f.Flush()
+	}
+	return
+}
+
+// autoProposeHandler triggers multiple requests to go out, one after another
+func autoProposeHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println("autoproposer started...")
+
+	fw := flushWriter{w: w}
+	if f, ok := w.(http.Flusher); ok {
+		fw.f = f
+	}
+
+	results := make(chan []byte)
+	wg := &sync.WaitGroup{}
+	for i := 1; i <= 20; i++ {
+		wg.Add(1)
+		log.Printf("issuing new proposal %d", i)
+		leaderPort := ports[0]
+		go func(i int) {
+			resp, err := http.Get(fmt.Sprintf("http://localhost:%s/propose/%d", leaderPort, i))
+			if err != nil {
+				log.Printf("auto proposer error: %v", err)
+				return
+			}
+			defer resp.Body.Close()
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				log.Println(err)
+				body = []byte(fmt.Sprintf("error getting response body: %v", err))
+			}
+			select {
+			case results <- body:
+			case <-time.After(BigTimeout):
+				// no leakin' goroutines
+				return
+			}
+		}(i)
+		// have some timeout, but faster than the average endpoint response time
+		<-time.After(EndpointRandomTimeCap/4 + 1)
+	}
+
+	go func() {
+		for {
+			select {
+			case r := <-results:
+				fw.Write(r)
+				wg.Done()
+			case <-time.After(BigTimeout):
+				// no leakin' goroutines
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
 }
 
 // this global state syncs our learner nodes; I don't think it is against the spirit to have this
@@ -298,7 +383,7 @@ func phaseRunnerA(phase string, id int64, val int64, payloadChan chan Payload) {
 			}
 			select {
 			case payloadChan <- payload:
-			case <-time.After(1 * time.Minute):
+			case <-time.After(BigTimeout):
 				// don't leak goroutines
 				return
 			}
@@ -336,12 +421,10 @@ func phaseRunnerA(phase string, id int64, val int64, payloadChan chan Payload) {
 				if len(ports)%2 == 1 {
 					majority += 1
 				}
-				log.Printf("looking for majority of %d", majority)
 				if counter > majority {
-					log.Printf("majority found")
 					wg.Done()
 				}
-			case <-time.After(1 * time.Minute):
+			case <-time.After(BigTimeout):
 				// don't leak the goroutine
 				return
 			}
@@ -366,7 +449,7 @@ func phaseRunnerB(phase string, nodeID int, id int64, val int64) (Payload, error
 
 	// if we have newer request already handled, reject this request
 	if id < state.PromiseID || id < state.AcceptedID {
-		log.Printf("Node %d: command id %d less than promise id %d or accepted id %d", nodeID, id, state.PromiseID, state.AcceptedID)
+		log.Printf("Node %d: rejected command id %d less than promise id %d or accepted id %d", nodeID, id, state.PromiseID, state.AcceptedID)
 		return state, fmt.Errorf("rejected")
 	}
 
@@ -376,7 +459,12 @@ func phaseRunnerB(phase string, nodeID int, id int64, val int64) (Payload, error
 	}
 
 	// update state
-	state.AcceptedID = id
+	if phase == "phase 1.a" {
+		state.PromiseID = id
+	} else if phase == "phase 2.a" {
+		state.AcceptedID = id
+	}
+
 	acceptors.state[nodeID] = state
 
 	return state, nil
