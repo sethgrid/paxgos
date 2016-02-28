@@ -1,0 +1,136 @@
+Sample Presentation
+01 Mar 2016
+Tags: go golang paxos
+
+Seth Ammons
+Software Engineer; Distributed Systems
+seth.ammons@gmail.com
+http://sethammons.com/
+
+* Who am I?
+
+- Go Enthusiast
+- Senior Engineer at [[http://www.sendgrid.com][SendGrid]] (we're hiring!)
+- Lives in a village
+
+.image ./black_and_white.jpg
+
+* Distributed Systems 095
+
+- [[https://en.wikipedia.org/wiki/Two_Generals%27_Problem][Byzantine Generals Problem, aka The Two Generals Problem]]
+.image https://upload.wikimedia.org/wikipedia/commons/3/39/The_seizure_of_Edessa_in_Syria_by_the_Byzantine_army_and_the_Arabic_counterattack_from_the_Chronicle_of_John_Skylitzes.jpg _ 500
+
+- [[http://amturing.acm.org/p558-lamport.pdf][Time, Clocks, and the Ordering of Events in a Distributed System]]
+.image http://bolour.com/blog/wp-content/uploads/2009/09/vector-clock-basic-event-system.gif _ 400
+
+* Paxos Made Simple
+- [[http://research.microsoft.com/en-us/um/people/lamport/pubs/paxos-simple.pdf][Paxos Made Simple]] by Leslie Lamport (2001)
+- Most of the text presented here is directly copied from his paper
+
+.image http://www.lamport.org/leslie.jpg 400 _
+
+* Paxos 101 - cliff notes
+
+- There are three roles: proposer, acceptor, and learner
+- Each process plays all three
+- A distinguished proposer and distinguished learner is chosen (the Leader)
+- Stable storage, written ahead of a send, maintains the highest proposal that a proposer has tried to issue
+
+.image https://healthunlimitedbiz.files.wordpress.com/2015/01/cliffnotes-truth.jpg 300 _
+
+* Paxos 101 - Evolution of the Requirements (P)
+
+  P1. An acceptor must accept the first proposal that it receives
+# unicode whitespace below to separate sections
+ 
+  P2. If a proposal with value v is chosen, then every higher-numbered proposal
+  that is chosen has value v
+# unicode whitespace below to separate sections
+ 
+  P2a. If a proposal with value v is chosen, then every higher-numbered proposal
+  accepted by any acceptor has value v
+# unicode whitespace below to separate sections
+ 
+  P2b. If a proposal with value v is chosen, then every higher-numbered proposal
+  issued by any proposer has value v
+# unicode whitespace below to separate sections
+ 
+  P2b leads to: Every acceptor in [set] C has accepted a proposal with number
+  in m . .(n − 1), and every proposal with number in m . .(n − 1) accepted by
+  any acceptor has value v.
+
+* Paxos 101 - Evolution of the Requirements
+
+  P2c. For any v and n, if a proposal with value v and number n is issued,
+  then there is a set S consisting of a majority of acceptors such that either
+  (a) no acceptor in S has accepted any proposal numbered less than n, or
+  (b) v is the value of the highest-numbered proposal among all proposals numbered
+  less than n accepted by the acceptors in S.
+ 
+What does this mean?
+
+*It* *means* *we* *can* *define* *the* *two* *phases* *of* *the* *Paxos* *Algorithm!*
+
+.image http://catplanet.org/wp-content/uploads/2014/11/YAY.jpg 300 _
+
+* Paxos Algorithm - Phase 1 of 2
+
+- *(a)* A proposer selects a proposal number n and sends a prepare request with number n to a majority of acceptors.
+
+- *(b)* If an acceptor receives a prepare request with number n greater than that of any prepare request to which it has already responded, then it responds to the request with a promise not to accept any more proposals numbered less than n and with the highest-numbered proposal (if any) that it has accepted.
+
+* Paxos Algorithm - Phase 2 of 2
+
+- *(a)* If the proposer receives a response to its prepare requests (numbered n) from a majority of acceptors, then it sends an accept request to each of those acceptors for a proposal numbered n with a value v, where v is the value of the highest-numbered proposal among the responses, or is any value if the responses reported no proposals.
+
+- *(b)* If an acceptor receives an accept request for a proposal numbered n, it accepts the proposal unless it has already responded to a prepare request having a number greater than n
+
+* Paxos to Paxgos
+
+.image https://wblender.files.wordpress.com/2012/03/buzz.jpg
+- "You are a TOY!"
+- Model Phase 1 and 2 of the Paxos Algorithm
+- Not concenred with leader election
+- Not concenred with multiple distinguished learners
+
+* Paxgos' basic setup
+
+  func main(){
+    /* read flags, set defaults, boring stuff */
+    if err := runNodes(numNodes, startingPort); err != nil {
+      log.Fatal(err)
+    }
+  }
+# unicode whitespace below to separate sections
+ 
+  r := mux.NewRouter()
+
+  // leader specific
+  r.HandleFunc("/propose/{val}", proposeHandler)
+  r.HandleFunc("/autopropose", autoProposeHandler)
+
+  // acceptor endpoints
+  r.HandleFunc("/prepare/{id}/{val}", randomDelay(prepareHandler))
+  r.HandleFunc("/accept/{id}/{val}", randomDelay(acceptHandler))
+
+  // learner endpoint
+  r.HandleFunc("/learn/{id}/{val}", learnHandler)
+
+  // default
+  r.HandleFunc("/", historyHandler)
+
+* Running Paxgos
+
+  $ go run main.go -endpoint-random-cap .2s -nodes 10 -timeout 30s -failure-rate 15
+
+Then hit either leader specific endpoints from another terminal:
+
+  $ curl localhost:9000/propose/655321
+
+or
+
+  $ curl localhost:9000/autopropose
+
+* imgur pun
+
+.image http://i.imgur.com/xvqX2tP.jpg _ 700
