@@ -423,6 +423,7 @@ func phaseRunnerA(phase string, id int64, val int64, payloadChan chan Payload) {
 				}
 				if counter > majority {
 					wg.Done()
+					return
 				}
 			case <-time.After(BigTimeout):
 				// don't leak the goroutine
